@@ -660,9 +660,8 @@ class WebDriverTestDriverProtocolPart(TestDriverProtocolPart):
 
     def run(self, url, script_resume, test_window=None):
         if test_window is None:
-            self._test_window = self.parent.base.current_window
-        else:
-            self._test_window = test_window
+            test_window = self.parent.base.current_window
+        self._test_window = test_window
 
         # Reset exceptions list.
         self._unexpected_exceptions = []

@@ -442,6 +442,12 @@ class ChromeDriverRefTestExecutor(WebDriverRefTestExecutor):
     protocol_cls = ChromeDriverProtocol
 
     def __init__(self, *args, sanitizer_enabled=False, enable_tracing=False, **kwargs):
+        require_webdriver_bidi = kwargs.get("browser_settings", {}).get(
+            "require_webdriver_bidi", None)
+        if require_webdriver_bidi:
+            self.protocol_cls = ChromeDriverBidiProtocol
+        else:
+            self.protocol_cls = ChromeDriverProtocol
         super().__init__(*args, **kwargs)
         self.sanitizer_enabled = sanitizer_enabled
         self.enable_tracing = enable_tracing

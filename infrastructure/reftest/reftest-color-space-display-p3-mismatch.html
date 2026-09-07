@@ -1,0 +1,21 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Display-P3 screenshot capture preserves out-of-sRGB colors</title>
+<meta name="assert" content="A Display-P3 screenshot keeps Display-P3 red distinct from sRGB red.">
+<meta name="reftest-color-space" content="display-p3">
+<link rel="mismatch" href="reftest-color-space-display-p3-mismatch-ref.html">
+
+<style>
+  html,
+  body {
+    margin: 0;
+  }
+
+  div {
+    width: 100px;
+    height: 100px;
+    background: color(display-p3 1 0 0);
+  }
+</style>
+
+<div></div>

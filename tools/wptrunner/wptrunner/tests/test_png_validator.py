@@ -3,6 +3,7 @@ import io
 import logging
 import struct
 import zlib
+from typing import Optional
 
 import pytest
 
@@ -28,6 +29,149 @@ def _chunk(chunk_type: bytes, data: bytes) -> bytes:
 
 _PNG_SIG = b"\x89PNG\r\n\x1a\n"
 
+# ICC profile emitted by Chromium's Skia PNG encoder for a Display-P3
+# screenshot. The enclosing PNG used "_" as its iCCP profile name.
+_CHROMIUM_DISPLAY_P3_ICC = base64.b64decode(
+    (
+        "AAACCAAAAAAEMAAAbW50clJHQiBYWVogB+AAAQABAAAAAAAAYWNzcAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAEAAPbWAAEAAAAA0y0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJZGVzYwAAAPAAAABkclhZWgAAAVQAAAAUZ1hZWgAA"
+        "AWgAAAAUYlhZWgAAAXwAAAAUd3RwdAAAAZAAAAAUclRSQwAAAaQAAAAoZ1RSQwAAAaQAAAAo"
+        "YlRSQwAAAaQAAAAoY3BydAAAAcwAAAA8bWx1YwAAAAAAAAABAAAADGVuVVMAAABGAAAAHABE"
+        "AGkAcwBwAGwAYQB5ACAAUAAzACAARwBhAG0AdQB0ACAAdwBpAHQAaAAgAHMAUgBHAEIAIABU"
+        "AHIAYQBuAHMAZgBlAHIAAFhZWiAAAAAAAACD3gAAPb7///+7WFlaIAAAAAAAAEq+AACxNgAA"
+        "CrlYWVogAAAAAAAAKDsAABEMAADIzVhZWiAAAAAAAAD21gABAAAAANMtcGFyYQAAAAAABAAA"
+        "AAJmZgAA8qcAAA1ZAAAT0AAAClsAAAAAAAAAAG1sdWMAAAAAAAAAAQAAAAxlblVTAAAAIAAA"
+        "ABwARwBvAG8AZwBsAGUAIABJAG4AYwAuACAAMgAwADEANg=="
+    )
+)
+
+_SRGB_COLORANTS = (
+    (0.436066, 0.222488, 0.013916),
+    (0.385147, 0.716873, 0.097076),
+    (0.143066, 0.060608, 0.714096),
+)
+
+
+def _iccp_chunk(profile: bytes, name: bytes = b"_", method: int = 0) -> bytes:
+    return _chunk(
+        b"iCCP",
+        name + b"\x00" + bytes([method]) + zlib.compress(profile),
+    )
+
+
+def _fixed_16_16(value: float) -> bytes:
+    return struct.pack(">i", round(value * 65536))
+
+
+def _xyz_tag(values: tuple[float, float, float]) -> bytes:
+    return b"XYZ \x00\x00\x00\x00" + b"".join(
+        _fixed_16_16(value) for value in values
+    )
+
+
+def _para_type_4_trc(parameters: tuple[float, ...]) -> bytes:
+    assert len(parameters) == 7
+    return (
+        b"para\x00\x00\x00\x00\x00\x04\x00\x00" +
+        b"".join(_fixed_16_16(value) for value in parameters)
+    )
+
+
+def _srgb_to_linear(value: float) -> float:
+    if value <= 0.04045:
+        return value / 12.92
+    return ((value + 0.055) / 1.055) ** 2.4
+
+
+def _sampled_srgb_trc(count: int) -> bytes:
+    samples = (
+        round(_srgb_to_linear(index / (count - 1)) * 65535)
+        for index in range(count)
+    )
+    return (
+        b"curv\x00\x00\x00\x00" + struct.pack(">I", count) +
+        b"".join(struct.pack(">H", sample) for sample in samples)
+    )
+
+
+def _make_icc_profile(
+    colorants: tuple[tuple[float, float, float], ...],
+    trc: bytes,
+    extra_tags: tuple[tuple[bytes, bytes], ...] = (),
+) -> bytes:
+    tags = [
+        (b"rXYZ", _xyz_tag(colorants[0])),
+        (b"gXYZ", _xyz_tag(colorants[1])),
+        (b"bXYZ", _xyz_tag(colorants[2])),
+        (b"rTRC", trc),
+        (b"gTRC", trc),
+        (b"bTRC", trc),
+    ]
+    tags.extend(extra_tags)
+    table_end = 132 + len(tags) * 12
+    records = bytearray()
+    payload = bytearray()
+    data_ranges = {}
+
+    for signature, data in tags:
+        if data not in data_ranges:
+            offset = table_end + len(payload)
+            data_ranges[data] = (offset, len(data))
+            payload.extend(data)
+            payload.extend(b"\x00" * (-len(payload) % 4))
+        records.extend(signature)
+        records.extend(struct.pack(">II", *data_ranges[data]))
+
+    profile = bytearray(128)
+    profile[8:12] = b"\x04\x30\x00\x00"
+    profile[12:16] = b"mntr"
+    profile[16:20] = b"RGB "
+    profile[20:24] = b"XYZ "
+    profile[36:40] = b"acsp"
+    profile[68:80] = b"".join(
+        _fixed_16_16(value) for value in (0.9642, 1.0, 0.8249)
+    )
+    profile.extend(struct.pack(">I", len(tags)))
+    profile.extend(records)
+    profile.extend(payload)
+    struct.pack_into(">I", profile, 0, len(profile))
+    return bytes(profile)
+
+
+def _replace_icc_tag(profile: bytes, signature: bytes, data: bytes) -> bytes:
+    result = bytearray(profile)
+    tag_count = struct.unpack_from(">I", result, 128)[0]
+    for index in range(tag_count):
+        record_offset = 132 + index * 12
+        if result[record_offset:record_offset + 4] != signature:
+            continue
+        offset, size = struct.unpack_from(">II", result, record_offset + 4)
+        assert len(data) == size
+        result[offset:offset + size] = data
+        return bytes(result)
+    raise AssertionError(f"Missing ICC tag {signature!r}")
+
+
+def _replace_icc_colorants(
+    profile: bytes,
+    colorants: tuple[tuple[float, float, float], ...],
+) -> bytes:
+    for signature, values in zip((b"rXYZ", b"gXYZ", b"bXYZ"), colorants):
+        profile = _replace_icc_tag(profile, signature, _xyz_tag(values))
+    return profile
+
+
+def _rename_icc_tag(profile: bytes, old: bytes, new: bytes) -> bytes:
+    result = bytearray(profile)
+    tag_count = struct.unpack_from(">I", result, 128)[0]
+    for index in range(tag_count):
+        record_offset = 132 + index * 12
+        if result[record_offset:record_offset + 4] == old:
+            result[record_offset:record_offset + 4] = new
+            return bytes(result)
+    raise AssertionError(f"Missing ICC tag {old!r}")
+
 
 def _make_png(
     width: int = 4,
@@ -35,7 +179,7 @@ def _make_png(
     bit_depth: int = 8,
     color_type: int = 2,  # RGB
     extra_chunks: tuple = (),
-    idat: bytes | None = None,
+    idat: Optional[bytes] = None,
 ) -> bytes:
     ihdr = struct.pack(">IIBBBBB", width, height, bit_depth, color_type, 0, 0, 0)
     parts = [_PNG_SIG, _chunk(b"IHDR", ihdr)]
@@ -60,7 +204,7 @@ class TestParsePng:
         assert info.height == 4
         assert info.bit_depth == 8
         assert info.color_type == 2
-        assert info.color_space == ColorSpace.SRGB
+        assert info.color_space == ColorSpace.UNKNOWN
         assert not info.alpha
 
     def test_8bit_rgba(self):
@@ -98,15 +242,256 @@ class TestParsePng:
         info = parse_png(png)
         assert info.color_space == ColorSpace.REC2100_HLG
 
-    def test_iccp_display_p3(self):
-        name = b"Display P3\x00"
-        compressed = zlib.compress(b"fake icc profile data")
-        chunk_data = name + b"\x00" + compressed
-        png = _make_png(extra_chunks=(_chunk(b"iCCP", chunk_data),))
+    @pytest.mark.parametrize("chunk_data", [
+        bytes([12, 13, 0]),
+        bytes([12, 13, 0, 1, 0]),
+        bytes([12, 13, 1, 1]),
+        bytes([12, 13, 0, 2]),
+    ])
+    def test_invalid_cicp(self, chunk_data):
+        png = _make_png(extra_chunks=(_chunk(b"cICP", chunk_data),))
+        with pytest.raises(InvalidPNGError, match="cICP"):
+            parse_png(png)
+
+    def test_cicp_takes_precedence_over_iccp_and_srgb(self):
+        png = _make_png(extra_chunks=(
+            _chunk(b"sRGB", b"\x00"),
+            _iccp_chunk(_CHROMIUM_DISPLAY_P3_ICC),
+            _chunk(b"cICP", bytes([9, 16, 0, 1])),
+        ))
+        assert parse_png(png).color_space == ColorSpace.REC2100_PQ
+
+    def test_iccp_takes_precedence_over_srgb(self):
+        png = _make_png(extra_chunks=(
+            _chunk(b"sRGB", b"\x00"),
+            _iccp_chunk(_CHROMIUM_DISPLAY_P3_ICC),
+        ))
+        assert parse_png(png).color_space == ColorSpace.DISPLAY_P3
+
+    def test_iccp_chromium_display_p3(self):
+        png = _make_png(
+            extra_chunks=(_iccp_chunk(_CHROMIUM_DISPLAY_P3_ICC),)
+        )
         info = parse_png(png)
         assert info.has_iccp
-        assert "display p3" in (info.iccp_profile_name or "").lower()
+        assert info.iccp_profile_name == "_"
         assert info.color_space == ColorSpace.DISPLAY_P3
+
+    def test_iccp_profile_name_is_not_used_for_display_p3(self):
+        png = _make_png(extra_chunks=(
+            _iccp_chunk(_CHROMIUM_DISPLAY_P3_ICC, name=b"sRGB"),
+        ))
+        info = parse_png(png)
+        assert info.iccp_profile_name == "sRGB"
+        assert info.color_space == ColorSpace.DISPLAY_P3
+
+    def test_iccp_srgb_ignores_display_p3_profile_name(self):
+        srgb_profile = _replace_icc_colorants(
+            _CHROMIUM_DISPLAY_P3_ICC, _SRGB_COLORANTS
+        )
+        png = _make_png(extra_chunks=(
+            _iccp_chunk(srgb_profile, name=b"Display P3"),
+        ))
+        info = parse_png(png)
+        assert info.iccp_profile_name == "Display P3"
+        assert info.color_space == ColorSpace.SRGB
+
+    def test_iccp_sampled_srgb_curve(self):
+        profile = _make_icc_profile(
+            _SRGB_COLORANTS, _sampled_srgb_trc(257)
+        )
+        png = _make_png(extra_chunks=(_iccp_chunk(profile),))
+        assert parse_png(png).color_space == ColorSpace.SRGB
+
+    def test_iccp_non_srgb_curve_is_unknown(self):
+        gamma_22 = _para_type_4_trc(
+            (2.2, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+        )
+        profile = _make_icc_profile(
+            (
+                (0.515102, 0.241182, -0.001049),
+                (0.291965, 0.692236, 0.041882),
+                (0.157153, 0.066582, 0.784378),
+            ),
+            gamma_22,
+        )
+        png = _make_png(extra_chunks=(_iccp_chunk(profile),))
+        assert parse_png(png).color_space == ColorSpace.UNKNOWN
+
+    def test_iccp_parametric_curve_checks_branch_boundary(self):
+        trc = _para_type_4_trc(
+            (2.4, 1 / 1.055, 0.055 / 1.055,
+             100.0, 0.003, 0.0, 0.0)
+        )
+        profile = _make_icc_profile(_SRGB_COLORANTS, trc)
+        png = _make_png(extra_chunks=(_iccp_chunk(profile),))
+        assert parse_png(png).color_space == ColorSpace.UNKNOWN
+
+    @pytest.mark.parametrize("mutation", ["reserved", "trailing"])
+    def test_iccp_invalid_parametric_curve(self, mutation):
+        trc = bytearray(_para_type_4_trc(
+            (2.4, 1 / 1.055, 0.055 / 1.055,
+             1 / 12.92, 0.04045, 0.0, 0.0)
+        ))
+        if mutation == "reserved":
+            trc[10] = 1
+        else:
+            trc.extend(b"\x00" * 4)
+        profile = _make_icc_profile(_SRGB_COLORANTS, bytes(trc))
+        png = _make_png(extra_chunks=(_iccp_chunk(profile),))
+        with pytest.raises(InvalidPNGError, match="parametric curve"):
+            parse_png(png)
+
+    def test_iccp_sampled_curve_checks_every_entry(self):
+        trc = bytearray(_sampled_srgb_trc(1025))
+        struct.pack_into(">H", trc, 12 + 1021 * 2, 0xffff)
+        profile = _make_icc_profile(_SRGB_COLORANTS, bytes(trc))
+        png = _make_png(extra_chunks=(_iccp_chunk(profile),))
+        assert parse_png(png).color_space == ColorSpace.UNKNOWN
+
+    def test_iccp_unknown_rgb_profile(self):
+        unknown_colorants = list(_SRGB_COLORANTS)
+        unknown_colorants[0] = (0.486066, 0.222488, 0.013916)
+        profile = _replace_icc_colorants(
+            _CHROMIUM_DISPLAY_P3_ICC, tuple(unknown_colorants)
+        )
+        png = _make_png(extra_chunks=(
+            _iccp_chunk(profile, name=b"Display P3"),
+        ))
+        assert parse_png(png).color_space == ColorSpace.UNKNOWN
+
+    def test_iccp_missing_required_tag_is_unknown(self):
+        profile = _rename_icc_tag(
+            _CHROMIUM_DISPLAY_P3_ICC, b"rXYZ", b"xxxx"
+        )
+        png = _make_png(extra_chunks=(_iccp_chunk(profile),))
+        assert parse_png(png).color_space == ColorSpace.UNKNOWN
+
+    @pytest.mark.parametrize("offset, value", [
+        (12, b"scnr"),
+        (16, b"CMYK"),
+        (20, b"Lab "),
+    ])
+    def test_iccp_unsupported_header_is_unknown(self, offset, value):
+        profile = bytearray(_CHROMIUM_DISPLAY_P3_ICC)
+        profile[offset:offset + 4] = value
+        png = _make_png(extra_chunks=(_iccp_chunk(bytes(profile)),))
+        assert parse_png(png).color_space == ColorSpace.UNKNOWN
+
+    def test_iccp_forward_transform_takes_precedence(self):
+        profile = _make_icc_profile(
+            _SRGB_COLORANTS,
+            _sampled_srgb_trc(257),
+            extra_tags=((b"A2B0", b"mft1\x00\x00\x00\x00"),),
+        )
+        png = _make_png(extra_chunks=(_iccp_chunk(profile),))
+        assert parse_png(png).color_space == ColorSpace.UNKNOWN
+
+    def test_iccp_invalid_compressed_data(self):
+        png = _make_png(extra_chunks=(
+            _chunk(b"iCCP", b"_\x00\x00not zlib data"),
+        ))
+        with pytest.raises(InvalidPNGError, match="compressed ICC"):
+            parse_png(png)
+
+    def test_iccp_invalid_compression_method(self):
+        png = _make_png(extra_chunks=(
+            _iccp_chunk(_CHROMIUM_DISPLAY_P3_ICC, method=1),
+        ))
+        with pytest.raises(InvalidPNGError, match="compression method"):
+            parse_png(png)
+
+    def test_iccp_invalid_profile_signature(self):
+        profile = bytearray(_CHROMIUM_DISPLAY_P3_ICC)
+        profile[36:40] = b"nope"
+        png = _make_png(extra_chunks=(_iccp_chunk(bytes(profile)),))
+        with pytest.raises(InvalidPNGError, match="signature"):
+            parse_png(png)
+
+    def test_iccp_invalid_declared_profile_size(self):
+        profile = bytearray(_CHROMIUM_DISPLAY_P3_ICC)
+        struct.pack_into(">I", profile, 0, len(profile) - 4)
+        png = _make_png(extra_chunks=(_iccp_chunk(bytes(profile)),))
+        with pytest.raises(InvalidPNGError, match="profile size"):
+            parse_png(png)
+
+    def test_iccp_out_of_bounds_tag(self):
+        profile = bytearray(_CHROMIUM_DISPLAY_P3_ICC)
+        struct.pack_into(">II", profile, 136, len(profile) - 4, 20)
+        png = _make_png(extra_chunks=(_iccp_chunk(bytes(profile)),))
+        with pytest.raises(InvalidPNGError, match="out of bounds"):
+            parse_png(png)
+
+    def test_iccp_unaligned_tag(self):
+        profile = bytearray(_CHROMIUM_DISPLAY_P3_ICC)
+        offset = struct.unpack_from(">I", profile, 136)[0]
+        struct.pack_into(">I", profile, 136, offset + 1)
+        png = _make_png(extra_chunks=(_iccp_chunk(bytes(profile)),))
+        with pytest.raises(InvalidPNGError, match="not aligned"):
+            parse_png(png)
+
+    def test_iccp_overlapping_tags(self):
+        profile = bytearray(_CHROMIUM_DISPLAY_P3_ICC)
+        first_offset, first_size = struct.unpack_from(">II", profile, 136)
+        struct.pack_into(">II", profile, 148,
+                         first_offset + first_size - 4, 20)
+        png = _make_png(extra_chunks=(_iccp_chunk(bytes(profile)),))
+        with pytest.raises(InvalidPNGError, match="overlap"):
+            parse_png(png)
+
+    def test_iccp_duplicate_tag(self):
+        profile = bytearray(_CHROMIUM_DISPLAY_P3_ICC)
+        profile[144:148] = profile[132:136]
+        png = _make_png(extra_chunks=(_iccp_chunk(bytes(profile)),))
+        with pytest.raises(InvalidPNGError, match="Duplicate"):
+            parse_png(png)
+
+    def test_iccp_invalid_pcs_illuminant(self):
+        profile = bytearray(_CHROMIUM_DISPLAY_P3_ICC)
+        profile[68:80] = b"\x00" * 12
+        png = _make_png(extra_chunks=(_iccp_chunk(bytes(profile)),))
+        with pytest.raises(InvalidPNGError, match="PCS illuminant"):
+            parse_png(png)
+
+    def test_iccp_trailing_compressed_data(self):
+        compressed = zlib.compress(_CHROMIUM_DISPLAY_P3_ICC) + b"trailing"
+        png = _make_png(extra_chunks=(
+            _chunk(b"iCCP", b"_\x00\x00" + compressed),
+        ))
+        with pytest.raises(InvalidPNGError, match="trailing data"):
+            parse_png(png)
+
+    def test_iccp_profile_size_is_limited(self):
+        compressed = zlib.compress(b"\x00" * (4 * 1024 * 1024 + 1))
+        png = _make_png(extra_chunks=(
+            _chunk(b"iCCP", b"_\x00\x00" + compressed),
+        ))
+        with pytest.raises(InvalidPNGError, match="size limit"):
+            parse_png(png)
+
+    @pytest.mark.parametrize("chunk_data", [
+        b"missing separator",
+        b"\x00\x00data",
+        b"_\x00",
+    ])
+    def test_iccp_invalid_structure(self, chunk_data):
+        png = _make_png(extra_chunks=(_chunk(b"iCCP", chunk_data),))
+        with pytest.raises(InvalidPNGError):
+            parse_png(png)
+
+    @pytest.mark.parametrize("name", [
+        b" leading",
+        b"trailing ",
+        b"two  spaces",
+        b"control\x7f",
+        b"x" * 80,
+    ])
+    def test_iccp_invalid_profile_name(self, name):
+        png = _make_png(extra_chunks=(
+            _iccp_chunk(_CHROMIUM_DISPLAY_P3_ICC, name=name),
+        ))
+        with pytest.raises(InvalidPNGError, match="profile name"):
+            parse_png(png)
 
     def test_not_png(self):
         with pytest.raises(InvalidPNGError, match="signature"):
@@ -140,6 +525,14 @@ class TestValidateContract:
         info = PngInfo(4, 4, 8, 2, ColorSpace.DISPLAY_P3)
         contract = CaptureContract(ColorSpace.SRGB)
         with pytest.raises(MalformedCaptureError, match="Colour space mismatch"):
+            validate_contract(info, contract)
+
+    def test_unknown_color_space(self):
+        info = PngInfo(4, 4, 8, 2, ColorSpace.UNKNOWN)
+        contract = CaptureContract(ColorSpace.SRGB)
+        with pytest.raises(
+            MalformedCaptureError, match="PNG reports unknown"
+        ):
             validate_contract(info, contract)
 
     def test_bit_depth_too_low(self):

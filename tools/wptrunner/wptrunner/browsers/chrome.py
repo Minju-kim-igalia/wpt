@@ -341,11 +341,14 @@ class ChromeBrowser(WebDriverBrowser):
             (test.testdriver_features is not None and
              "extensions" in test.testdriver_features) or
             (test.path is not None and "web-extensions/" in test.path))
+        requires_color_space_capture = (
+            getattr(test, "color_space", None) is not None)
         self._require_webdriver_bidi = (
             (test.testdriver_features is not None and
              ("bidi" in test.testdriver_features or
               "extensions" in test.testdriver_features)) or
-            self._is_extension_test)
+            self._is_extension_test or
+            requires_color_space_capture)
 
         return {
             **settings, "require_webdriver_bidi": self._require_webdriver_bidi,
